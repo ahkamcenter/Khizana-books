@@ -1,0 +1,75 @@
+# نص الكتب للقراءة داخل تطبيق الخزانة (نظام «نص» بجانب PDF)
+# يستخرج نص كل كتاب صفحةً صفحة: من طبقته النصية إن كانت سليمة، وإلا بالتعرف الضوئي (tesseract بالعربية)
+# ويرفعه إلى حاوية R2 (khizana-books) في txt/<اسم الكتاب>.json مع فهرس txt/index.json، فيقدّمه موقع الخزانة من /txt/
+# لا يُحفظ النص في هذا المستودع العام، والتطبيق لا يتيح تنزيله، بل القراءة والنسخ في مكانه
+# يحتاج أسرار R2 الثلاثة نفسها التي في مستودع التطبيق: R2_ACCOUNT_ID و R2_ACCESS_KEY_ID و R2_SECRET_ACCESS_KEY
+# يعمل يدويًّا من تبويب Actions، وتلقائيًّا عند إضافة كتب جديدة (فيعالج الجديد وحده)
+name: txt
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["books/**"]
+concurrency: { group: txt, cancel-in-progress: false }
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: auto
+  ACC: ${{ secrets.R2_ACCOUNT_ID }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: { shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19] }
+    steps:
+      - name: الأسرار
+        run: if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "لم تُضف أسرار R2 في هذا المستودع بعد، فلا عمل"; else echo "OK=1" >> $GITHUB_ENV; fi
+      - if: env.OK == '1'
+        uses: actions/checkout@v4
+        with: { sparse-checkout: "books\ntools" }
+      - name: الأدوات
+        if: env.OK == '1'
+        run: |
+          sudo apt-get -qq update && sudo apt-get -qq install -y tesseract-ocr tesseract-ocr-ara >/dev/null
+          pip install -q pymupdf
+      - name: استخراج النص ورفعه
+        if: env.OK == '1'
+        run: |
+          EP="https://$(echo "$ACC" | grep -oE '[0-9a-f]{32}' | head -1).r2.cloudflarestorage.com"
+          aws s3 ls s3://khizana-books/txt/ --endpoint-url "$EP" | awk '{print $4}' | sed 's/\.json$//' | sort > have.txt || true
+          ls books/*.pdf | awk -v s=${{ matrix.shard }} 'NR % 20 == s' > list.txt
+          : > todo.txt; while read f; do n=$(basename "$f" .pdf); grep -qxF "$n" have.txt || echo "$f" >> todo.txt; done < list.txt
+          echo "كتب هذا الجزء: $(wc -l < todo.txt)"
+          mkdir -p out
+          # كل خمسة كتب تُرفع فورًا، فلا يضيع العمل إن انقطع
+          split -l 5 todo.txt part. 2>/dev/null || true
+          for p in part.*; do
+            [ -s "$p" ] || continue
+            xargs -a "$p" -d '\n' python3 tools/txt/txt_build.py --out out --min good --ocr || true
+            rm -f out/index.json
+            for j in out/*.json; do [ -e "$j" ] || continue
+              aws s3 cp "$j" "s3://khizana-books/txt/$(basename "$j")" --endpoint-url "$EP" --content-type "application/json; charset=utf-8" --only-show-errors && rm -f "$j"
+            done
+          done
+  index:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: فهرس الكتب التي لها نص
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then echo "لا أسرار"; exit 0; fi
+          EP="https://$(echo "$ACC" | grep -oE '[0-9a-f]{32}' | head -1).r2.cloudflarestorage.com"
+          mkdir t && aws s3 sync s3://khizana-books/txt/ t --endpoint-url "$EP" --exclude "index.json" --only-show-errors
+          python3 - <<'PY'
+          import json, glob, os
+          ix = {}
+          for f in glob.glob('t/*.json'):
+              try: d = json.load(open(f)); ix[os.path.basename(f)[:-5]] = [len(d['p']), d['q']]
+              except Exception: pass
+          json.dump(ix, open('index.json', 'w'), ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+          print('كتب لها نص:', len(ix))
+          PY
+          aws s3 cp index.json s3://khizana-books/txt/index.json --endpoint-url "$EP" --content-type "application/json; charset=utf-8"
